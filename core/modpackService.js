@@ -1,0 +1,110 @@
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const AdmZip = require('adm-zip');
+const { downloadFile } = require('./downloader');
+const { extractEntries } = require('./zipService');
+
+const API = 'https://api.modrinth.com/v2';
+const UA = { 'User-Agent': `EonCode/${require('../package.json').version} (github.com/4DRI4N-OFF/FerroLauncher)` };
+
+async function apiJson(url) {
+  const res = await fetch(url, { headers: UA });
+  if (!res.ok) throw new Error(`Modrinth HTTP ${res.status}: ${url}`);
+  return res.json();
+}
+
+async function searchModpacks(query, mcVersion, { loader = null, sort = 'relevance', limit = 24, offset = 0 } = {}) {
+  const facets = [[`versions:${mcVersion}`], ['project_type:modpack']];
+  if (loader) facets.push([`categories:${loader}`]);
+  const sorts = ['relevance', 'downloads', 'follows', 'newest', 'updated'];
+  const url = `${API}/search?query=${encodeURIComponent(query)}&facets=${encodeURIComponent(JSON.stringify(facets))}&limit=${limit}&offset=${offset}&index=${sorts.includes(sort) ? sort : 'relevance'}`;
+  const data = await apiJson(url);
+  return {
+    total: data.total_hits || 0,
+    hits: (data.hits || []).map((h) => ({
+      id: h.project_id, slug: h.slug, title: h.title,
+      description: h.description, icon: h.icon_url,
+      downloads: h.downloads, updated: h.date_modified,
+    })),
+  };
+}
+
+async function packVersions(projectId, mcVersion, loader = ['fabric', 'forge', 'neoforge', 'quilt']) {
+  const url = `${API}/project/${encodeURIComponent(projectId)}/version?game_versions=${encodeURIComponent(JSON.stringify([mcVersion]))}&loaders=${encodeURIComponent(JSON.stringify(loader))}`;
+  return apiJson(url);
+}
+
+async function getPackVersion(packVersionId) {
+  return apiJson(`${API}/version/${encodeURIComponent(packVersionId)}`);
+}
+
+// Descarga el .mrpack y vuelca su contenido en instanceDir.
+// Devuelve { mcVersion, loaderVersion, files } para configurar la instancia.
+function loaderFromDeps(deps) {
+  const depEntries = [['fabric-loader', 'fabric'], ['quilt-loader', 'quilt'], ['forge', 'forge'], ['neoforge', 'neoforge']];
+  let loaderType = 'fabric', loaderVersion = null;
+  for (const [key, type] of depEntries) {
+    if (deps[key]) { loaderType = type; loaderVersion = deps[key]; break; }
+  }
+  return { loaderType, loaderVersion };
+}
+
+function readMrpackManifest(mrpackPath) {
+  const zip = new AdmZip(mrpackPath);
+  const indexEntry = zip.getEntry('modrinth.index.json');
+  if (!indexEntry) throw new Error("Paczka .mrpack nie zawiera modrinth.index.json");
+  const index = JSON.parse(zip.readAsText(indexEntry));
+  const deps = index.dependencies || {};
+  return { name: index.name, mcVersion: deps.minecraft, ...loaderFromDeps(deps) };
+}
+
+async function installMrpack(instanceDir, mrpackUrl, onLog) {
+  fs.mkdirSync(instanceDir, { recursive: true });
+  const isLocal = fs.existsSync(mrpackUrl);
+  const tmp = isLocal ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'ferro-pack-'));
+  const packPath = isLocal ? mrpackUrl : path.join(tmp, 'pack.mrpack');
+  if (!isLocal) {
+    onLog && onLog("[eoncode] Pobieranie paczki modyfikacji…\n");
+    await downloadFile(mrpackUrl, packPath);
+  }
+  const zip = new AdmZip(packPath);
+  const indexEntry = zip.getEntry('modrinth.index.json');
+  if (!indexEntry) throw new Error("Paczka .mrpack nie zawiera modrinth.index.json");
+  const index = JSON.parse(zip.readAsText(indexEntry));
+  const deps = index.dependencies || {};
+  const files = (index.files || []).filter((f) => f.env?.client !== 'unsupported');
+
+  onLog && onLog(`[eoncode] Paczka modyfikacji ${index.name} v${index.versionId}: ${files.length} plików (MC ${deps.minecraft})\n`);
+  const CONC = 8;
+  let done = 0;
+  for (let i = 0; i < files.length; i += CONC) {
+    await Promise.all(files.slice(i, i + CONC).map(async (f) => {
+      const url = f.downloads?.[0];
+      if (!url) return;
+      const rel = path.normalize(f.path).replace(/\\/g, '/');
+      if (rel.startsWith('..') || path.isAbsolute(rel)) { onLog && onLog(`[eoncode] Pominięto ścieżkę poza instancją: ${f.path}\n`); return; }
+      const dest = path.join(instanceDir, rel);
+      try {
+        const st = fs.statSync(dest);
+        if (st.size === f.fileSize) return;
+      } catch {}
+      await downloadFile(url, dest, undefined, f.fileSize, f.hashes?.sha1);
+    }));
+    done += Math.min(CONC, files.length - done);
+    onLog && onLog(`[eoncode] Paczka modyfikacji ${done}/${files.length}\n`);
+  }
+  // overrides/ -> raíz de la instancia, CON sus subcarpetas: overrides/config/x.cfg
+  // tiene que caer en config/x.cfg. Rutas raras o salidas del destino se saltan
+  // y se avisan en consola (antes se callaban y, además, se aplastaban al raíz).
+  const ov = extractEntries(zip, instanceDir, {
+    stripPrefix: 'overrides/',
+    onSkip: (name, why) => onLog && onLog(`[eoncode] Pominięto dodatkowy plik: ${name}${why ? ` (${why})` : ''}\n`),
+  });
+  if (ov.written) onLog && onLog(`[eoncode] Dodatkowe pliki: ${ov.written} plików\n`);
+  try { if (!isLocal) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  const { loaderType, loaderVersion } = loaderFromDeps(deps);
+  return { name: index.name, mcVersion: deps.minecraft, loaderType, loaderVersion, files: files.length, overrides: ov.written };
+}
+
+module.exports = { searchModpacks, packVersions, getPackVersion, installMrpack, readMrpackManifest, loaderFromDeps };

@@ -1,0 +1,98 @@
+{
+  "name": "eon-launcher",
+  "version": "0.9.13",
+  "description": "EonLauncher — Minecraft i przestrzeń twórców EonCode",
+  "author": "Adrian Garcia Martinez",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:5173 && electron . --dev\"",
+    "build": "vite build",
+    "lint": "eslint . --max-warnings 166",
+    "test": "node scripts/run-tests.js",
+    "test:docs": "node scripts/docs-version.js --check",
+    "check": "npm run lint && npm run test && npm run test:docs && npm run build",
+    "docs:version": "node scripts/docs-version.js",
+    "dist": "npm run build && electron-builder --win nsis portable",
+    "dist:full": "npm run dist",
+    "start": "electron .",
+    "preview": "node scripts/preview.js"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-free": "^7.3.1",
+    "adm-zip": "^0.6.1",
+    "discord-rpc": "^4.0.1",
+    "electron-updater": "^6.8.9",
+    "lucide-react": "^1.42.0",
+    "mineflayer": "^4.39.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "skinview3d": "^3.4.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
+    "eslint": "^10.10.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "rcedit": "^5.0.2",
+    "vite": "^6.0.3",
+    "wait-on": "^8.0.3"
+  },
+  "allowScripts": {
+    "electron@44.3.0": true,
+    "esbuild@0.25.12": true
+  },
+  "build": {
+    "appId": "pl.eoncode.launcher",
+    "productName": "EonLauncher",
+    "directories": {
+      "output": "release"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "EonCode-DaVid",
+        "repo": "EonLauncher-Releases",
+        "releaseType": "release"
+      }
+    ],
+    "files": [
+      "electron/**/*",
+      "core/**/*",
+      "dist/**/*",
+      "build/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "EonLauncher",
+      "artifactName": "EonLauncher-Setup.exe"
+    },
+    "portable": {
+      "artifactName": "EonLauncher-portable.exe"
+    },
+    "afterPack": "./scripts/after-pack.cjs"
+  }
+}

@@ -1,0 +1,206 @@
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const AdmZip = require('adm-zip');
+const { downloadFile } = require('./downloader');
+const { extractEntries } = require('./zipService');
+
+const API = 'https://api.curseforge.com/v1';
+const UA = { 'User-Agent': `EonCode/${require('../package.json').version} (github.com/4DRI4N-OFF/FerroLauncher)` };
+const MC_GAME_ID = 432;
+const CLASS = { mod: 6, modpack: 4471, resourcepack: 12 };
+const LOADERS = { forge: 1, fabric: 4, quilt: 5, neoforge: 6 };
+const SORTS = { relevance: 1, downloads: 6, newest: 11, updated: 3, name: 4 };
+
+function cfgPath(baseDir) {
+  return path.join(baseDir, 'ferro-config.json');
+}
+function readCfg(baseDir) {
+  try { return JSON.parse(fs.readFileSync(cfgPath(baseDir), 'utf8')); } catch { return {}; }
+}
+function getKey(baseDir) {
+  return process.env.CURSEFORGE_KEY || readCfg(baseDir).cfKey || '';
+}
+function setKey(baseDir, key) {
+  const p = cfgPath(baseDir);
+  const cfg = readCfg(baseDir);
+  cfg.cfKey = String(key || '').trim();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+  return !!cfg.cfKey;
+}
+
+async function api(baseDir, url) {
+  const key = getKey(baseDir);
+  if (!key) throw new Error("Brak klucza API CurseForge. Uzupełnij go w zakładce Modyfikacje.");
+  const res = await fetch(url, { headers: { 'x-api-key': key, Accept: 'application/json', ...UA } });
+  if (res.status === 403) throw new Error("CurseForge odrzucił klucz API (403)");
+  if (res.status === 429) throw new Error("Przekroczono limit CurseForge. Poczekaj minutę.");
+  if (!res.ok) throw new Error(`CurseForge HTTP ${res.status}`);
+  return res.json();
+}
+
+async function search(baseDir, query, mcVersion, kind = 'mod', sort = 'downloads') {
+  const qs = new URLSearchParams({
+    gameId: String(MC_GAME_ID),
+    classId: String(CLASS[kind] || 6),
+    gameVersion: mcVersion,
+    searchFilter: query || '',
+    sortField: String(SORTS[sort] || 6),
+    sortOrder: 'desc',
+    pageSize: '24',
+  });
+  let data;
+  try {
+    data = await api(baseDir, `${API}/mods/search?${qs}`);
+  } catch (e) {
+    if (/403/.test(e.message)) {
+      throw new Error("Klucz CurseForge nie pozwala na wyszukiwanie. Może wymagać zatwierdzenia przez support@curseforge.com. Możesz użyć listy popularnych projektów.");
+    }
+    throw e;
+  }
+  return {
+    total: data.pagination?.totalCount || 0,
+    hits: (data.data || []).map(hit),
+  };
+}
+
+const KNOWN_LOADERS = ['forge', 'fabric', 'quilt', 'neoforge', 'cauldron', 'liteloader', 'rift'];
+function loaderNames(f) {
+  const out = [];
+  for (const g of f.sortableGameVersions || []) {
+    if (g.gameVersionTypeId === 68441 && g.name) out.push(g.name);
+  }
+  for (const v of f.gameVersions || []) {
+    const hit = KNOWN_LOADERS.find((k) => String(v).toLowerCase() === k);
+    if (hit && !out.some((o) => o.toLowerCase() === hit)) out.push(hit);
+  }
+  return out;
+}
+
+function hit(m) {
+  return {
+    id: m.id, title: m.name, description: m.summary,
+    icon: m.logo?.url || null, downloads: m.downloadCount || 0,
+    updated: m.dateModified || null, loaders: [],
+  };
+}
+
+// Plan B sin /search: populares + recién actualizados (funciona con keys nuevas)
+async function trending(baseDir) {
+  const key = getKey(baseDir);
+  if (!key) throw new Error("Brak klucza API CurseForge. Uzupełnij go w zakładce Modyfikacje.");
+  const res = await fetch(`${API}/mods/featured`, {
+    method: 'POST',
+    headers: { 'x-api-key': key, Accept: 'application/json', 'Content-Type': 'application/json', ...UA },
+    body: JSON.stringify({ gameId: MC_GAME_ID, excludedModIds: [] }),
+  });
+  if (!res.ok) throw new Error(`CurseForge HTTP ${res.status}`);
+  const data = await res.json();
+  const seen = new Map();
+  for (const m of [...(data.data?.popular || []), ...(data.data?.recentlyUpdated || [])]) {
+    if (!seen.has(m.id)) seen.set(m.id, hit(m));
+  }
+  const hits = [...seen.values()];
+  return { total: hits.length, hits };
+}
+
+async function files(baseDir, modId, mcVersion, loader) {
+  const qs = new URLSearchParams({ gameVersion: mcVersion });
+  if (loader && LOADERS[loader]) qs.set('modLoaderType', String(LOADERS[loader]));
+  const data = await api(baseDir, `${API}/mods/${modId}/files?${qs}`);
+  return (data.data || []).map((f) => ({
+    id: f.id, name: f.fileName, date: f.fileDate,
+    url: f.downloadUrl, size: f.fileLength,
+    versions: f.gameVersions || [], loaders: loaderNames(f),
+  }));
+}
+
+const KIND_DIR = { mod: 'mods', modpack: '__pack__', resourcepack: 'resourcepacks', shader: 'shaderpacks' };
+
+async function installFile(baseDir, instanceDir, modId, fileId, kind, onLog) {
+  const data = await api(baseDir, `${API}/mods/${modId}/files/${fileId}`);
+  const f = data.data;
+  if (!f?.downloadUrl) throw new Error("Ten plik nie ma bezpośredniego adresu pobierania");
+  if (kind === 'modpack') {
+    throw new Error("Ta paczka CurseForge wymaga ręcznego pobrania");
+  }
+  const dir = path.join(instanceDir, KIND_DIR[kind] || 'mods');
+  const safe = String(f.fileName).replace(/[^\w\-.+() \[\]]+/g, '_');
+  await downloadFile(f.downloadUrl, path.join(dir, safe), undefined, f.fileLength || undefined);
+  onLog && onLog(`[eoncode] Zainstalowano ${safe}\n`);
+  return { file: safe };
+}
+
+function parseLoaderId(id) {
+  const m = String(id || '').match(/^(forge|fabric|quilt|neoforge)[-_]?(.+)$/i);
+  if (!m) return { type: 'forge', version: null };
+  return { type: m[1].toLowerCase(), version: m[2] || null };
+}
+
+function safeName(n) {
+  return String(n || 'file').replace(/[^\w\-.+() \[\]]+/g, '_');
+}
+
+// Fase 1: descarga el zip y lee el manifest (sin tocar instancias)
+async function inspectPack(baseDir, modId, fileId) {
+  const info = await api(baseDir, `${API}/mods/${modId}/files/${fileId}`);
+  const f = info.data;
+  if (!f?.downloadUrl) throw new Error("Ten plik nie ma bezpośredniego adresu pobierania");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ferro-cfpack-'));
+  const zipPath = path.join(tmp, 'pack.zip');
+  await downloadFile(f.downloadUrl, zipPath);
+  const zip = new AdmZip(zipPath);
+  const manEntry = zip.getEntry('manifest.json');
+  if (!manEntry) throw new Error("Niepoprawna paczka CurseForge: brak manifest.json");
+  const man = JSON.parse(zip.readAsText(manEntry));
+  const mc = man.minecraft?.version;
+  if (!mc) throw new Error("Manifest nie określa wersji Minecraft");
+  const loaders = man.minecraft?.modLoaders || [];
+  const prim = loaders.find((l) => l.primary) || loaders[0] || {};
+  const { type: loaderType, version: loaderVersion } = parseLoaderId(prim.id || prim);
+  return {
+    name: man.name || 'Modpack', mcVersion: mc, loaderType, loaderVersion,
+    files: (man.files || []).length, tmpDir: tmp, zipPath,
+  };
+}
+
+// Fase 2: vuelca mods + overrides en la instancia ya creada
+async function finishPack(baseDir, tmpDir, zipPath, instanceDir, onLog) {
+  const zip = new AdmZip(zipPath);
+  const manEntry = zip.getEntry('manifest.json');
+  const man = JSON.parse(zip.readAsText(manEntry));
+  const allFiles = man.files || [];
+  onLog && onLog(`[eoncode] pack ${man.name}: ${allFiles.length} plików\n`);
+  const CONC = 8;
+  let done = 0;
+  for (let i = 0; i < allFiles.length; i += CONC) {
+    await Promise.all(allFiles.slice(i, i + CONC).map(async (x) => {
+      try {
+        const fi = await api(baseDir, `${API}/mods/${x.projectID}/files/${x.fileID}`);
+        const u = fi.data?.downloadUrl;
+        if (!u) return;
+        const dest = path.join(instanceDir, 'mods', safeName(fi.data.fileName));
+        try {
+          const st = fs.statSync(dest);
+          if (st.size === fi.data.fileLength) return;
+        } catch {}
+        await downloadFile(u, dest, undefined, fi.data.fileLength || undefined);
+      } catch (e) {
+        onLog && onLog(`[eoncode] Pominięto plik: ${x.projectID}/${x.fileID} (${e.message?.slice(0, 60)})\n`);
+      }
+    }));
+    done += Math.min(CONC, allFiles.length - done);
+    onLog && onLog(`[eoncode] modpack ${done}/${allFiles.length}\n`);
+  }
+  // overrides/ conservando subcarpetas (ver modpackService: mismo criterio)
+  const ov = extractEntries(zip, instanceDir, {
+    stripPrefix: 'overrides/',
+    onSkip: (name, why) => onLog && onLog(`[eoncode] Pominięto dodatkowy plik: ${name}${why ? ` (${why})` : ''}\n`),
+  });
+  if (ov.written) onLog && onLog(`[eoncode] overrides: ${ov.written} plików\n`);
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  return { files: allFiles.length };
+}
+
+module.exports = { getKey, setKey, search, trending, files, installFile, inspectPack, finishPack, parseLoaderId };

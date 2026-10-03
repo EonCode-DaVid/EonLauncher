@@ -1,0 +1,16 @@
+node_modules/
+dist/
+dist-electron/
+release/
+build/secrets.json
+.ferro/
+.ferro-test/
+*.log
+.eon-*
+EonLauncher*.exe
+# Datos del launcher (viven en userData, no en el repo):
+/instances/
+/libraries/
+/assets/
+/versions/
+/runtimes/

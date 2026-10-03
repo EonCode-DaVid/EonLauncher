@@ -1,0 +1,35 @@
+name: Publikuj EonLauncher
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Zbuduj i opublikuj wersję Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Zainstaluj zależności
+        run: npm ci
+
+      - name: Sprawdź projekt
+        run: npm run check
+
+      - name: Opublikuj instalator i dane aktualizacji
+        env:
+          GH_TOKEN: ${{ secrets.EON_RELEASE_TOKEN }}
+        run: npx electron-builder --win nsis portable --publish always
+

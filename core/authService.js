@@ -1,0 +1,348 @@
+const fs = require('fs');
+const path = require('path');
+
+// Client ID jest dołączany do build/secrets.json podczas pakowania. Użytkownicy
+// końcowi nie muszą go znać ani wpisywać; konfiguracja UI pozostaje awaryjna.
+const DEFAULT_CLIENT_ID = 'd0bdc248-0a09-4247-81a2-a9312d8b75af';
+const DEFAULT_DISCORD_ID = '';
+
+const MS_DEVICE = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode';
+const MS_TOKEN = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token';
+const MS_AUTHORIZE = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize';
+const NATIVE_REDIRECT = 'https://login.microsoftonline.com/common/oauth2/nativeclient';
+const SCOPE = 'XboxLive.signin offline_access';
+const XBL_AUTH = 'https://user.auth.xboxlive.com/user/authenticate';
+const XSTS_AUTH = 'https://xsts.auth.xboxlive.com/xsts/authorize';
+const MC_LOGIN = 'https://api.minecraftservices.com/authentication/login_with_xbox';
+const MC_PROFILE = 'https://api.minecraftservices.com/minecraft/profile';
+
+function authPaths(baseDir) {
+  return {
+    config: path.join(baseDir, 'ferro-config.json'),
+    account: path.join(baseDir, 'account.json'), // legado v1 (se migra solo)
+    accounts: path.join(baseDir, 'accounts.json'),
+  };
+}
+
+function readJson(p, fallback = null) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
+}
+
+// --- tokens en reposo -------------------------------------------------------
+// Windows cifra con DPAPI a través de safeStorage (clave del perfil de usuario).
+// Donde no esté disponible (otro SO, keyring roto, tests) se sigue guardando en
+// claro y el launcher funciona igual: es un mejora progresiva, no un requisito.
+const SECRET_FIELDS = ['mcToken', 'msRefresh', 'uhs'];
+
+let safeOverride = null; // costura para tests: setSafeStorageForTest()
+function setSafeStorageForTest(ss) { safeOverride = ss; }
+
+function getSafe() {
+  if (safeOverride !== null) return safeOverride;
+  try {
+    const ss = require('electron').safeStorage;
+    if (!ss || typeof ss.encryptString !== 'function') return null;
+    return ss.isEncryptionAvailable() ? ss : null;
+  } catch { return null; }
+}
+
+function encryptAccount(acc, safe) {
+  if (!safe) return acc;
+  const sec = {};
+  for (const k of SECRET_FIELDS) if (acc[k] !== undefined) sec[k] = acc[k];
+  if (!Object.keys(sec).length) return acc;
+  const out = { ...acc };
+  for (const k of SECRET_FIELDS) delete out[k];
+  out.secrets = safe.encryptString(JSON.stringify(sec)).toString('base64');
+  return out;
+}
+
+function decryptAccount(acc, safe) {
+  if (!acc || !acc.secrets) return acc;
+  const out = { ...acc };
+  delete out.secrets;
+  if (!safe) return null; // hay sesión cifrada pero no podemos leerla: mejor no fingir que existe
+  try {
+    Object.assign(out, JSON.parse(safe.decryptString(Buffer.from(String(acc.secrets), 'base64'))));
+  } catch { return null; }
+  return out;
+}
+
+// IDs de distribución: build/secrets.json local (gitignored) para tus builds.
+// Nunca commitees IDs: rota en Azure/Discord si alguno se filtró al historial.
+function localSecrets() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'build', 'secrets.json'), 'utf8'));
+  } catch { return {}; }
+}
+
+function getClientId(baseDir) {
+  return readJson(authPaths(baseDir).config, {}).clientId || process.env.FERRO_CLIENT_ID || localSecrets().clientId || DEFAULT_CLIENT_ID;
+}
+
+// Versión pública para la UI: nunca expone el ID completo
+function maskId(id) {
+  const s = String(id || '');
+  if (!s) return '';
+  return '••••' + s.slice(-4);
+}
+
+function getClientIdPublic(baseDir) {
+  const id = getClientId(baseDir);
+  return { masked: maskId(id), configured: !!id };
+}
+
+function setClientId(baseDir, clientId) {
+  const p = authPaths(baseDir).config;
+  const cfg = readJson(p, {});
+  cfg.clientId = String(clientId || '').trim();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+  return cfg.clientId;
+}
+
+function getDiscord(baseDir) {
+  const cfg = readJson(authPaths(baseDir).config, {});
+  return { clientId: cfg.discordClientId || process.env.FERRO_DISCORD_ID || localSecrets().discordId || DEFAULT_DISCORD_ID, enabled: cfg.discordEnabled !== false };
+}
+
+function setDiscord(baseDir, patch) {
+  const p = authPaths(baseDir).config;
+  const cfg = readJson(p, {});
+  if (patch.clientId !== undefined) cfg.discordClientId = String(patch.clientId || '').trim();
+  if (patch.enabled !== undefined) cfg.discordEnabled = !!patch.enabled;
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+  return getDiscord(baseDir);
+}
+
+async function form(url, params) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params),
+  });
+  return res.json();
+}
+
+async function json(url, body, token) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, data };
+}
+
+// Paso 1: pide el código para microsoft.com/link
+async function deviceStart(clientId) {
+  if (!clientId) throw new Error("Brak identyfikatora aplikacji Microsoft. Uzupełnij go w zakładce Moje konto.");
+  const data = await form(MS_DEVICE, { client_id: clientId, scope: SCOPE });
+  if (data.error) throw new Error(`Microsoft: ${data.error_description || data.error}`);
+  return {
+    deviceCode: data.device_code,
+    userCode: data.user_code,
+    verificationUri: data.verification_uri,
+    expiresIn: data.expires_in,
+    interval: (data.interval || 5) * 1000,
+  };
+}
+
+// Paso 2: un intento de canje (el renderer lo llama cada `interval`)
+async function devicePollOnce(clientId, deviceCode) {
+  const data = await form(MS_TOKEN, {
+    grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    client_id: clientId,
+    device_code: deviceCode,
+  });
+  if (data.error === 'authorization_pending') return { status: 'pending' };
+  if (data.error) return { status: 'error', error: data.error_description || data.error };
+  return { status: 'done', accessToken: data.access_token, refreshToken: data.refresh_token, expiresIn: data.expires_in };
+}
+
+const XSTS_ERRORS = {
+  2148916233: "To konto Microsoft nie ma profilu Xbox. Utwórz go na xbox.com.",
+  2148916238: "Konto dziecka wymaga zgody opiekuna na grę online.",
+};
+
+async function xboxLogin(msAccessToken) {
+  const { status, data } = await json(XBL_AUTH, {
+    Properties: { AuthMethod: 'RPS', SiteName: 'user.auth.xboxlive.com', RpsTicket: `d=${msAccessToken}` },
+    RelyingParty: 'http://auth.xboxlive.com',
+    TokenType: 'JWT',
+  });
+  if (status !== 200 || !data.Token) throw new Error("Xbox Live odrzucił token Microsoft");
+  const uhs = data.DisplayClaims?.xui?.[0]?.uhs;
+  const { status: s2, data: d2 } = await json(XSTS_AUTH, {
+    Properties: { SandboxId: 'RETAIL', UserTokens: [data.Token] },
+    RelyingParty: 'rp://api.minecraftservices.com/',
+    TokenType: 'JWT',
+  });
+  if (s2 !== 200 || !d2.Token) {
+    const xerr = Number(d2?.XErr);
+    throw new Error(XSTS_ERRORS[xerr] || `XSTS error ${xerr || s2}`);
+  }
+  const outUhs = d2.DisplayClaims?.xui?.[0]?.uhs || uhs;
+  if (!outUhs || !d2.Token) throw new Error("Xbox nie zwrócił pełnych danych konta (uhs)");
+  return { uhs: outUhs, xstsToken: d2.Token };
+}
+
+async function minecraftLogin(uhs, xstsToken) {
+  const { status, data } = await json(MC_LOGIN, { identityToken: `XBL3.0 x=${uhs};${xstsToken}` });
+  if (status !== 200 || !data.access_token) {
+    const detail = data?.errorMessage || data?.error || '';
+    if (/invalid app registration/i.test(detail)) throw new Error('Minecraft odrzucił rejestrację EonLauncher (HTTP 403). Twórca launchera musi uzyskać zatwierdzenie Client ID w Minecraft AppID Review. Ten błąd nie określa, czy konto posiada grę.');
+    if (status === 401) throw new Error('Minecraft odrzucił sesję (HTTP 401). Zaloguj się ponownie przez Microsoft.');
+    throw new Error(`Minecraft nie pozwolił dokończyć logowania (HTTP ${status})${detail ? `: ${detail}` : '. Spróbuj ponownie później.'}`);
+  }
+  return { mcToken: data.access_token, expiresIn: data.expires_in };
+}
+
+async function fetchProfile(mcToken) {
+  const res = await fetch(MC_PROFILE, { headers: { Authorization: `Bearer ${mcToken}` } });
+  if (res.status === 404) throw new Error("To konto nie ma zakupionej gry Minecraft Java");
+  if (!res.ok) throw new Error(`Mojang HTTP ${res.status}`);
+  const p = await res.json();
+  return { uuid: p.id, name: p.name, skins: p.skins || [], capes: p.capes || [] };
+}
+
+// En memoria las cuentas van SIEMPRE con los tokens en claro (es lo que espera
+// todo el resto del código); el cifrado es solo del archivo de disco.
+function loadStore(baseDir) {
+  const p = authPaths(baseDir);
+  let store = readJson(p.accounts, null);
+  if (!store) {
+    // Migra el formato v1 (una cuenta) al multi-cuenta
+    const old = readJson(p.account, null);
+    store = { active: null, accounts: {} };
+    if (old?.profile?.uuid) {
+      store.accounts[old.profile.uuid] = old;
+      store.active = old.profile.uuid;
+    }
+    try { fs.mkdirSync(path.dirname(p.accounts), { recursive: true }); fs.writeFileSync(p.accounts, JSON.stringify(store, null, 2)); } catch (e) { console.error("[eoncode] nie udało się zapisać accounts.json:", e.message); }
+  }
+  store.accounts = store.accounts || {};
+  const safe = getSafe();
+  let upgraded = false;
+  if (safe) {
+    for (const [uuid, acc] of Object.entries(store.accounts)) {
+      if (acc && acc.secrets) store.accounts[uuid] = decryptAccount(acc, safe) || null;
+      else if (acc && SECRET_FIELDS.some((k) => acc[k] !== undefined)) upgraded = true; // aún en claro: se cifra al reescribir
+      if (!store.accounts[uuid]) delete store.accounts[uuid]; // blob ilegible = sesión inservible, no cuenta a medias
+    }
+    if (store.active && !store.accounts[store.active]) store.active = Object.keys(store.accounts)[0] || null;
+    // migración: lo que había en claro se reescribe ya cifrado (writeStore cifra)
+    if (upgraded) {
+      try { writeStore(baseDir, store); } catch (e) { console.error("[eoncode] nie udało się zaszyfrować tokenów konta:", e.message); }
+    }
+  } else {
+    for (const [uuid, acc] of Object.entries(store.accounts)) if (acc && acc.secrets) delete store.accounts[uuid];
+  }
+  return store;
+}
+
+function writeStore(baseDir, store) {
+  const p = authPaths(baseDir).accounts;
+  const safe = getSafe();
+  const toDisk = {
+    active: store.active || null,
+    accounts: Object.fromEntries(Object.entries(store.accounts || {}).map(([uuid, acc]) => [uuid, safe ? encryptAccount(acc, safe) : acc])),
+  };
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(toDisk, null, 2));
+}
+
+function saveAccount(baseDir, account) {
+  const store = loadStore(baseDir);
+  const withStamp = { ...account, savedAt: Date.now() };
+  store.accounts[account.profile.uuid] = withStamp;
+  store.active = account.profile.uuid;
+  writeStore(baseDir, store);
+}
+
+function loadAccount(baseDir) {
+  const store = loadStore(baseDir);
+  return (store.active && store.accounts[store.active]) || null;
+}
+
+function listAccounts(baseDir) {
+  const store = loadStore(baseDir);
+  return Object.values(store.accounts).map((a) => ({
+    uuid: a.profile?.uuid, name: a.profile?.name, active: a.profile?.uuid === store.active,
+  }));
+}
+
+function setActive(baseDir, uuid) {
+  const store = loadStore(baseDir);
+  if (uuid !== null && !store.accounts[uuid]) throw new Error("Nie znaleziono konta");
+  store.active = uuid;
+  writeStore(baseDir, store);
+  return true;
+}
+
+function removeAccount(baseDir, uuid) {
+  const store = loadStore(baseDir);
+  delete store.accounts[uuid];
+  if (store.active === uuid) store.active = Object.keys(store.accounts)[0] || null;
+  writeStore(baseDir, store);
+  return true;
+}
+
+function clearAccount(baseDir) {
+  const store = loadStore(baseDir);
+  if (store.active) delete store.accounts[store.active];
+  store.active = Object.keys(store.accounts)[0] || null;
+  writeStore(baseDir, store);
+}
+
+// Completa el login tras el device flow: Xbox -> Minecraft -> perfil -> guarda
+async function completeLogin(baseDir, msAccess, msRefresh) {
+  const { uhs, xstsToken } = await xboxLogin(msAccess);
+  const { mcToken, expiresIn } = await minecraftLogin(uhs, xstsToken);
+  const profile = await fetchProfile(mcToken);
+  const account = {
+    mcToken, mcExpiry: Date.now() + (expiresIn || 86400) * 1000,
+    msRefresh, uhs, profile,
+  };
+  saveAccount(baseDir, account);
+  return account;
+}
+
+// Devuelve cuenta válida (refresca si el token MC caducó)
+async function validAccount(baseDir, clientId) {
+  const acc = loadAccount(baseDir);
+  if (!acc) return null;
+  if (Date.now() < (acc.mcExpiry || 0) - 60000) return acc;
+  if (!acc.msRefresh) return null;
+  const data = await form(MS_TOKEN, {
+    grant_type: 'refresh_token', client_id: clientId,
+    refresh_token: acc.msRefresh, scope: SCOPE,
+  });
+  if (data.error || !data.access_token) return null;
+  return completeLogin(baseDir, data.access_token, data.refresh_token || acc.msRefresh);
+}
+
+module.exports = {
+  getClientId, getClientIdPublic, maskId, setClientId, getDiscord, setDiscord, deviceStart, devicePollOnce,
+  setSafeStorageForTest, encryptAccount, decryptAccount,
+  completeLogin, validAccount, loadAccount, saveAccount, clearAccount,
+  listAccounts, setActive, removeAccount,
+  exchangeCode, authorizeUrl, NATIVE_REDIRECT, SCOPE,
+};
+
+function authorizeUrl({ clientId, redirectUri, challenge, state }) {
+  return `${MS_AUTHORIZE}?client_id=${encodeURIComponent(clientId)}&response_type=code` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(SCOPE)}` +
+    `&code_challenge=${challenge}&code_challenge_method=S256&state=${state}&prompt=select_account`;
+}
+
+// Canjea un ?code= de Microsoft (ventana integrada o localhost) y completa el login
+async function exchangeCode({ clientId, code, redirectUri, verifier, baseDir }) {
+  const data = await form(MS_TOKEN, {
+    grant_type: 'authorization_code', client_id: clientId, code,
+    redirect_uri: redirectUri, code_verifier: verifier,
+  });
+  if (data.error || !data.access_token) throw new Error(data.error_description || data.error || "Token został odrzucony");
+  return completeLogin(baseDir, data.access_token, data.refresh_token);
+}
