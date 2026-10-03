@@ -39,7 +39,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "rcedit": "^5.0.2",
     "vite": "^6.0.3",
-    "wait-on": "^8.0.3"
+    "wait-on": "^9.5.1"
   },
   "allowScripts": {
     "electron@44.3.0": true,
